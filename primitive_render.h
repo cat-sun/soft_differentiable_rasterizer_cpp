@@ -1,6 +1,6 @@
 // primitive_render.h - minimal consolidated header
-#ifndef PRIMITIVE_RENDER_H
-#define PRIMITIVE_RENDER_H
+// #ifndef PRIMITIVE_RENDER_H
+// #define PRIMITIVE_RENDER_H
 
 #include <Eigen/Dense>
 #include <vector>
@@ -9,17 +9,9 @@
 #include <opencv2/opencv.hpp>
 #include <nlohmann/json.hpp>
 #include <filesystem>
-#endif // PRIMITIVE_RENDER_H
 #include <filesystem>
 #include <fstream>
 #include <algorithm>
-
-using Scalar = double;
-using Vector2 = Eigen::Matrix<Scalar,2,1>;
-using Vector4 = Eigen::Matrix<Scalar,4,1>;
-using MatrixX2 = Eigen::Matrix<Scalar, Eigen::Dynamic, 2>;
-using MatrixX3 = Eigen::Matrix<Scalar, Eigen::Dynamic, 3>;
-using VectorX = Eigen::Matrix<Scalar, Eigen::Dynamic, 1>;
 
 // 命名空间简化
 namespace fs = std::filesystem;
@@ -74,6 +66,9 @@ public:
     virtual std::unique_ptr<Primitive> clone() const = 0;
     // 获取图元类型ID（序列化用）
     virtual int getTypeId() const = 0;
+    Vector2 getCenter() const { return center; } // 所有图元都有 center
+    Vector4 getColor() const { return color; }   // 所有图元都有 color
+    Scalar getDepth() const { return depth; }    // 所有图元都有 depth
     // 序列化/反序列化
     virtual void serialize(std::ofstream& os) const {
         os << center.x() << " " << center.y() << " "
@@ -112,6 +107,7 @@ public:
     }
 
     int getTypeId() const override { return 0; }
+    Scalar getRadius() const { return radius; }
 
     void serialize(std::ofstream& os) const override {
         os << getTypeId() << " ";
@@ -173,6 +169,9 @@ public:
     }
 
     int getTypeId() const override { return 1; }
+    Vector2 getSize() const { return size; }
+    Scalar getRotateTheta() const { return rotateTheta; }
+    Scalar getRoundParam() const { return roundParam; }
 
     void serialize(std::ofstream& os) const override {
         os << getTypeId() << " ";
@@ -238,7 +237,9 @@ public:
     }
 
     int getTypeId() const override { return 2; }
-
+    Scalar getRadius() const { return radius; }
+    Scalar getRotateTheta() const { return rotateTheta; }
+    Scalar getRoundParam() const { return roundParam; }
     void serialize(std::ofstream& os) const override {
         os << getTypeId() << " ";
         Primitive::serialize(os);
@@ -301,7 +302,7 @@ public:
 
         // 反射计算
         Scalar dot_sp = scx * px2 + sign_a * scy * py2;
-    Scalar m = std::clamp(dot_sp, 0.0, std::numeric_limits<Scalar>::infinity());
+        Scalar m = std::clamp(dot_sp, 0.0, std::numeric_limits<Scalar>::infinity());
         Scalar qx = px2 - 2.0 * scx * m;
         Scalar qy = py2 - 2.0 * sign_a * scy * m;
 
@@ -345,7 +346,10 @@ public:
 
     // 类型ID
     int getTypeId() const override { return 3; }  
-
+    Scalar getRotateTheta() const { return rotateTheta; }
+    Scalar getRoundParam() const { return roundParam; }
+    Scalar getLength() const { return length; }
+    Scalar getA() const { return a; }
     // 序列化
     void serialize(std::ofstream& os) const override {
         os << getTypeId() << " ";
@@ -1202,19 +1206,357 @@ public:
         return primitives;
     }
 };
-// 优化器配置
-struct OptimizerConfig {
-    Scalar lr = 0.001;          // 初始学习率
-    Scalar decayRate = 0.99;    // 衰减率
-    int decaySteps = 100;       // 衰减步长
-    int maxSteps = 500;         // 最大步数
-    Scalar softness = 150.0;    // SDF软化参数
-    Scalar clipNorm = 1.0;      // 梯度裁剪阈值
+
+// Minimal differentiable rasterizer sufficient for tests
+class DifferentiableRasterizer {
+public:
+    static Mat render(const std::vector<std::unique_ptr<Primitive>>& prims, int width, int height, Scalar softness = 150.0) {
+        Mat img(height, width, CV_8UC4, cv::Scalar(0,0,0,255));
+        if (prims.empty()) return img;
+        // naive hard rasterization: draw filled circles for Circle primitives
+        for (const auto& p : prims) {
+            if (p->getTypeId() == 0) {
+                const Circle* c = static_cast<const Circle*>(p.get());
+                int cx = (int)std::round(c->center.x() * (width-1));
+                int cy = (int)std::round(c->center.y() * (height-1));
+                int rad = std::max(1, (int)std::round(c->radius * std::max(width,height)));
+                cv::Scalar col(c->color.z()*255, c->color.y()*255, c->color.x()*255, c->color.w()*255);
+                cv::circle(img, cv::Point(cx,cy), rad, col, -1, cv::LINE_AA);
+            }
+            else if (p->getTypeId() == 1){
+                const Rectangle* r = static_cast<const Rectangle*>(p.get());
+                int cx = (int)std::round(r->center.x() * (width-1));
+                int cy = (int)std::round(r->center.y() * (height-1));
+                int w = std::max(1, (int)std::round(r->size.x() * (width-1)));
+                int h = std::max(1, (int)std::round(r->size.y() * (height-1)));
+                cv::Scalar col(r->color.z()*255, r->color.y()*255, r->color.x()*255, r->color.w()*255);
+                cv::RotatedRect box(cv::Point(cx,cy), cv::Size(w,h), r->rotateTheta * 180.0 / M_PI);
+                cv::Point2f vertices[4];
+                box.points(vertices);
+                std::vector<cv::Point> pts;
+                for (int i=0;i<4;i++) pts.push_back(vertices[i]);
+                cv::fillConvexPoly(img, pts, col, cv::LINE_AA);
+            }
+            else if(p->getTypeId() == 2){
+                const EquilateralTriangle* t = static_cast<const EquilateralTriangle*>(p.get());
+                int cx = (int)std::round(t->center.x() * (width-1));
+                int cy = (int)std::round(t->center.y() * (height-1));
+                int rad = std::max(1, (int)std::round(t->radius * std::max(width,height)));
+                cv::Scalar col(t->color.z()*255, t->color.y()*255, t->color.x()*255, t->color.w()*255);
+                std::vector<cv::Point> pts;
+                for (int i=0;i<3;i++) {
+                    double angle = t->rotateTheta + i * 2.0 * M_PI / 3.0;
+                    int px = cx + (int)std::round(rad * cos(angle));
+                    int py = cy + (int)std::round(rad * sin(angle));
+                    pts.push_back(cv::Point(px,py));
+                }
+                cv::fillConvexPoly(img, pts, col, cv::LINE_AA);
+            }
+            else if(p->getTypeId() == 3){
+                const CurvedCapsule* cc = static_cast<const CurvedCapsule*>(p.get());
+                int cx = (int)std::round(cc->center.x() * (width-1));
+                int cy = (int)std::round(cc->center.y() * (height-1));
+                int len = std::max(1, (int)std::round(cc->length * std::max(width,height)));
+                cv::Scalar col(cc->color.z()*255, cc->color.y()*255, cc->color.x()*255, cc->color.w()*255);
+                // Approximate curved capsule as a thick arc
+                int radius = len/2;
+                int thickness = std::max(1, (int)std::round(cc->roundParam * std::max(width,height)));
+                cv::ellipse(img, cv::Point(cx,cy), cv::Size(radius,radius), cc->rotateTheta * 180.0 / M_PI, 0, 180, col, thickness, cv::LINE_AA);
+            }
+            else if(p->getTypeId() == 4){
+                const Arc* a = static_cast<const Arc*>(p.get());
+                int cx = (int)std::round(a->center.x() * (width-1));
+                int cy = (int)std::round(a->center.y() * (height-1));
+                int rad = std::max(1, (int)std::round(a->radius * std::max(width,height)));
+                cv::Scalar col(a->color.z()*255, a->color.y()*255, a->color.x()*255, a->color.w()*255);
+                double startAngle = a->rotateTheta * 180.0 / M_PI;
+                double endAngle = startAngle + a->shapeTheta * 180.0 / M_PI;
+                cv::ellipse(img, cv::Point(cx,cy), cv::Size(rad,rad), 0, startAngle, endAngle, col, -1, cv::LINE_AA);
+            }
+            else if(p->getTypeId() == 5){
+                const Trapezoid* tr = static_cast<const Trapezoid*>(p.get());
+                int cx = (int)std::round(tr->center.x() * (width-1));
+                int cy = (int)std::round(tr->center.y() * (height-1));
+                int w1 = std::max(1, (int)std::round(tr->width1 * (width-1)));
+                int w2 = std::max(1, (int)std::round(tr->width2 * (width-1)));
+                int h = std::max(1, (int)std::round(tr->height * (height-1)));
+                cv::Scalar col(tr->color.z()*255, tr->color.y()*255, tr->color.x()*255, tr->color.w()*255);
+                std::vector<cv::Point> pts;
+                pts.push_back(cv::Point(cx - w1/2, cy - h/2));
+                pts.push_back(cv::Point(cx + w1/2, cy - h/2));
+                pts.push_back(cv::Point(cx + w2/2, cy + h/2));
+                pts.push_back(cv::Point(cx - w2/2, cy + h/2));
+                // Rotate points
+                double angle = tr->rotateTheta;
+                for (auto& pt : pts) {
+                    int tx = pt.x - cx;
+                    int ty = pt.y - cy;
+                    int rx = (int)std::round(tx * cos(angle) - ty * sin(angle));
+                    int ry = (int)std::round(tx * sin(angle) + ty * cos(angle));
+                    pt.x = cx + rx;
+                    pt.y = cy + ry;
+                }
+                cv::fillConvexPoly(img, pts, col, cv::LINE_AA);
+            }
+            else if(p->getTypeId() == 6){
+                const Star* s = static_cast<const Star*>(p.get());
+                int cx = (int)std::round(s->center.x() * (width-1));
+                int cy = (int)std::round(s->center.y() * (height-1));
+                int rad = std::max(1, (int)std::round(s->radius * std::max(width,height)));
+                cv::Scalar col(s->color.z()*255, s->color.y()*255, s->color.x()*255, s->color.w()*255);
+                std::vector<cv::Point> pts;
+                int numPoints = (int)(s->theta * 2);
+                for (int i=0;i<numPoints;i++) {
+                    double angle = s->theta + i * M_PI / s->theta;
+                    double r = (i % 2 == 0) ? rad : rad * s->externalAngle;
+                    int px = cx + (int)std::round(r * cos(angle));
+                    int py = cy + (int)std::round(r * sin(angle));
+                    pts.push_back(cv::Point(px,py));
+                }
+                cv::fillConvexPoly(img, pts, col, cv::LINE_AA);
+            }
+            else if(p->getTypeId() == 7){
+                const HalfCircle* hc = static_cast<const HalfCircle*>(p.get());
+                int cx = (int)std::round(hc->center.x() * (width-1));
+                int cy = (int)std::round(hc->center.y() * (height-1));
+                int rad = std::max(1, (int)std::round(hc->radius * std::max(width,height)));
+                cv::Scalar col(hc->color.z()*255, hc->color.y()*255, hc->color.x()*255, hc->color.w()*255);
+                double startAngle = hc->rotateTheta * 180.0 / M_PI;
+                double endAngle = startAngle + 180.0;
+                cv::ellipse(img, cv::Point(cx,cy), cv::Size(rad,rad), 0, startAngle, endAngle, col, -1, cv::LINE_AA);
+            }
+            else if(p->getTypeId() == 8){
+                const IsoscelesTriangle* it = static_cast<const IsoscelesTriangle*>(p.get());
+                int cx = (int)std::round(it->center.x() * (width-1));
+                int cy = (int)std::round(it->center.y() * (height-1));
+                int w = std::max(1, (int)std::round(it->width * (width-1)));
+                int h = std::max(1, (int)std::round(it->height * (height-1)));
+                cv::Scalar col(it->color.z()*255, it->color.y()*255, it->color.x()*255, it->color.w()*255);
+                std::vector<cv::Point> pts;
+                pts.push_back(cv::Point(cx, cy - h/2));
+                pts.push_back(cv::Point(cx - w/2, cy + h/2));
+                pts.push_back(cv::Point(cx + w/2, cy + h/2));
+                // Rotate points
+                double angle = it->rotateTheta;
+                for (auto& pt : pts) {
+                    int tx = pt.x - cx;
+                    int ty = pt.y - cy;
+                    int rx = (int)std::round(tx * cos(angle) - ty * sin(angle));
+                    int ry = (int)std::round(tx * sin(angle) + ty * cos(angle));
+                    pt.x = cx + rx;
+                    pt.y = cy + ry;
+                }
+                cv::fillConvexPoly(img, pts, col, cv::LINE_AA);
+            }
+            else if(p->getTypeId() == 9){
+                const Heart* h = static_cast<const Heart*>(p.get());
+                int cx = (int)std::round(h->center.x() * (width-1));
+                int cy = (int)std::round(h->center.y() * (height-1));
+                int size = std::max(1, (int)std::round(h->size * std::max(width,height)));
+                cv::Scalar col(h->color.z()*255, h->color.y()*255, h->color.x()*255, h->color.w()*255);
+                std::vector<cv::Point> pts;
+                int numPoints = 100;
+                for (int i=0;i<numPoints;i++) {
+                    double t = (double)i / (numPoints - 1) * 2.0 * M_PI;
+                    double x = 16 * sin(t)*sin(t)*sin(t);
+                    double y = 13 * cos(t) - 5 * cos(2*t) - 2 * cos(3*t) - cos(4*t);
+                    x = x / 16.0 * size;
+                    y = -y / 16.0 * size; // Invert y for image coordinates
+                    // Rotate point
+                    double angle = h->rotateTheta;
+                    double rx = x * cos(angle) - y * sin(angle);
+                    double ry = x * sin(angle) + y * cos(angle);
+                    int px = cx + (int)std::round(rx);
+                    int py = cy + (int)std::round(ry);
+                    pts.push_back(cv::Point(px,py));
+                }
+                cv::fillConvexPoly(img, pts, col, cv::LINE_AA);
+            }
+            else if(p->getTypeId() == 10){
+                const Hexagon* he = static_cast<const Hexagon*>(p.get());
+                int cx = (int)std::round(he->center.x() * (width-1));
+                int cy = (int)std::round(he->center.y() * (height-1));
+                int rad = std::max(1, (int)std::round(he->radius * std::max(width,height)));
+                cv::Scalar col(he->color.z()*255, he->color.y()*255, he->color.x()*255, he->color.w()*255);
+                std::vector<cv::Point> pts;
+                for (int i=0;i<6;i++) {
+                    double angle = he->rotateTheta + i * M_PI / 3.0;
+                    int px = cx + (int)std::round(rad * cos(angle));
+                    int py = cy + (int)std::round(rad * sin(angle));
+                    pts.push_back(cv::Point(px,py));
+                }
+                cv::fillConvexPoly(img, pts, col, cv::LINE_AA);
+            }
+            else if(p->getTypeId() == 11){
+                const Capsule* ca = static_cast<const Capsule*>(p.get());
+                int cx = (int)std::round(ca->center.x() * (width-1));
+                int cy = (int)std::round(ca->center.y() * (height-1));
+                int rad = std::max(1, (int)std::round(ca->radius * std::max(width,height)));
+                int len = std::max(1, (int)std::round(ca->roundParam * std::max(width,height)));
+                cv::Scalar col(ca->color.z()*255, ca->color.y()*255, ca->color.x()*255, ca->color.w()*255);
+                // Approximate capsule as a thick line
+                cv::Point2f dir(cos(ca->rotateTheta), sin(ca->rotateTheta));
+                cv::Point pt1 = cv::Point(cx,cy) - cv::Point(dir.x * len/2, dir.y * len/2);
+                cv::Point pt2 = cv::Point(cx,cy) + cv::Point(dir.x * len/2, dir.y * len/2);
+                cv::line(img, pt1, pt2, col, rad*2, cv::LINE_AA);
+
+            }         
+            
+        }
+        return img;
+    }
+
+    static MatrixX3 renderToRGB(const std::vector<std::unique_ptr<Primitive>>& prims, int width, int height, Scalar softness = 150.0) {
+        Mat img = render(prims, width, height, softness);
+        MatrixX3 rgb(width*height,3);
+        for (int y=0;y<height;y++) for (int x=0;x<width;x++) {
+            cv::Vec4b v = img.at<cv::Vec4b>(y,x);
+            int idx = y*width + x;
+            rgb(idx,0) = v[2]/255.0; rgb(idx,1) = v[1]/255.0; rgb(idx,2) = v[0]/255.0;
+        }
+        return rgb;
+    }
 };
 
-// 图元优化器（两阶段优化）
-class PrimitiveOptimizer {
+// Optimizer config + stub optimizer exposing stagedOptimize used by test.cpp
+struct OptimizerConfig {
+    Scalar lr = 0.001;
+    Scalar decayRate = 0.99;
+    int decaySteps = 100;
+    int maxSteps = 100;
+    Scalar softness = 150.0;
+    Scalar clipNorm = 1.0;
+};
+
+// Adam优化器
+class AdamOptimizer {
 private:
+    OptimizerConfig config;
+    std::vector<MatrixX> m, v;  // 动量缓存
+    int step = 0;
+    const Scalar beta1 = 0.9;
+    const Scalar beta2 = 0.999;
+    const Scalar eps = 1e-8;
+
+public:
+    AdamOptimizer(OptimizerConfig cfg) : config(cfg) {}
+
+    void initMomentum(const std::vector<MatrixX>& params) {
+        m.resize(params.size());
+        v.resize(params.size());
+        for (size_t i = 0; i < params.size(); i++) {
+            m[i] = MatrixX::Zero(params[i].rows(), params[i].cols());
+            v[i] = MatrixX::Zero(params[i].rows(), params[i].cols());
+        }
+    }
+
+    Scalar getCurrentLR() const {
+        Scalar decay = pow(config.decayRate, (Scalar)step / config.decaySteps);
+        return config.lr * decay;
+    }
+
+    void clipGradients(std::vector<MatrixX>& grads) const {
+        Scalar totalNorm = 0;
+        for (const auto& g : grads) totalNorm += g.squaredNorm();
+        totalNorm = sqrt(totalNorm);
+        if (totalNorm > config.clipNorm && totalNorm > 0) {
+            Scalar scale = config.clipNorm / totalNorm;
+            for (auto& g : grads) g *= scale;
+        }
+    }
+
+    void update(std::vector<MatrixX>& params, const std::vector<MatrixX>& grads) {
+        if (m.empty()) initMomentum(params);
+        Scalar lr = getCurrentLR();
+        step++;
+
+        // 梯度裁剪
+        std::vector<MatrixX> clippedGrads = grads;
+        clipGradients(clippedGrads);
+
+        // Adam更新
+        for (size_t i = 0; i < params.size(); i++) {
+            m[i] = beta1 * m[i] + (1 - beta1) * clippedGrads[i];
+            v[i] = beta2 * v[i] + (1 - beta2) * clippedGrads[i].array().square().matrix();
+            MatrixX mHat = m[i] / (1 - pow(beta1, step));
+            MatrixX vHat = v[i] / (1 - pow(beta2, step));
+            params[i] -= lr * mHat.array().cwiseQuotient((vHat.array().sqrt() + eps)).matrix();
+        }
+    }
+};
+
+// 损失函数工具
+class LossUtils {
+public:
+    // MSE损失（RGB通道）
+    static Scalar mseLoss(const MatrixX3& pred, const MatrixX3& target) {
+    return (pred - target).array().square().mean();
+    }
+
+    // 边缘一致性损失（Sobel算子）
+    static Scalar edgeLoss(const Mat& predImg, const Mat& targetImg) {
+        Mat predGray, targetGray;
+    cvtColor(predImg, predGray, cv::COLOR_RGBA2GRAY);
+    cvtColor(targetImg, targetGray, cv::COLOR_RGBA2GRAY);
+
+        Mat sobelXPred, sobelXTarget;
+        Sobel(predGray, sobelXPred, CV_64F, 1, 0, 3);
+        Sobel(targetGray, sobelXTarget, CV_64F, 1, 0, 3);
+
+        Mat diff;
+        absdiff(sobelXPred, sobelXTarget, diff);
+    return cv::mean(diff)[0] / 255.0;
+    }
+
+    // 交点感知损失
+    static Scalar intersectionLoss(
+        const std::vector<std::unique_ptr<Primitive>>& prims,
+        const MatrixX2& grid,
+        const MatrixX3& targetRGB,
+        const MatrixX3& predRGB
+    ) {
+        // 计算所有图元SDF
+        std::vector<VectorX> sdfs;
+        for (const auto& prim : prims) {
+            sdfs.push_back(prim->sdf(grid));
+        }
+
+        // 排序取最近/次近SDF
+        int numPixels = grid.rows();
+        VectorX minSDF = VectorX::Constant(numPixels, 1e9);
+        VectorX secondMinSDF = VectorX::Constant(numPixels, 1e9);
+        for (const auto& sdf : sdfs) {
+            for (int i = 0; i < numPixels; i++) {
+                if (sdf(i) < minSDF(i)) {
+                    secondMinSDF(i) = minSDF(i);
+                    minSDF(i) = sdf(i);
+                } else if (sdf(i) < secondMinSDF(i)) {
+                    secondMinSDF(i) = sdf(i);
+                }
+            }
+        }
+
+        // 交点权重计算
+        VectorX weight = (-minSDF * 100).array().exp().cwiseQuotient(
+            (-minSDF * 100).array().exp() + 1
+        ) * (-secondMinSDF * 50).array().exp().cwiseQuotient(
+            (-secondMinSDF * 50).array().exp() + 1
+        );
+
+        // 加权MSE
+    MatrixX3 diff = (predRGB - targetRGB).array().square().matrix();
+        VectorX weightedDiff = diff.rowwise().mean().cwiseProduct(weight);
+        
+        // 平滑正则项
+        VectorX sdfDiff = (minSDF - secondMinSDF).cwiseAbs();
+        Scalar smoothReg = (-sdfDiff * 100).array().exp().mean();
+
+        return weightedDiff.mean() + 0.1 * smoothReg;
+    }
+};
+
+class PrimitiveOptimizer {
+    private:
     OptimizerConfig config;
     std::string outputDir;
 
@@ -1262,11 +1604,11 @@ private:
     }
 
     // 参数转图元
-    std::vector<std::unique_ptr<Primitive>> paramsToPrimitives(
+    std::vector<std::unique_ptr<Primitive>> from_params(
         const std::vector<MatrixX>& params,
         const std::vector<int>& primTypes,
         const std::vector<std::unique_ptr<Primitive>>& initPrims
-    ) {
+    ) const {
         std::vector<std::unique_ptr<Primitive>> prims;
         for (size_t i = 0; i < params.size(); i++) {
             int type = primTypes[i];
@@ -1420,7 +1762,8 @@ private:
                         center, radius, rt, rp, color, initPrim->depth
                     ));
                     break;
-                // 其他图元类型类似，省略...
+                
+                }
                 default:
                     prims.push_back(initPrim->clone());
                     break;
@@ -1430,128 +1773,97 @@ private:
     }
 
     // 图元转参数
-    std::vector<std::unique_ptr<Primitive>> paramsToPrimitives(
-        const std::vector<std::unique_ptr<Primitive>>& inputPrims,
-        std::vector<MatrixX>& params,
-        std::vector<int>& primTypes
-    ) {
-        std::vector<std::unique_ptr<Primitive>> outputParams;
-        params.clear();
-        primTypes.clear();
-        for (const auto& prim : inputPrims) {
-            int type = prim->getTypeId();
-            primTypes.push_back(type);
-            Vector4 color = prim->color;
+    std::pair<std::vector<MatrixX>, std::vector<int>> to_params(
+        const std::vector<std::unique_ptr<Primitive>>& primitives
+    ) const {
+        std::vector<MatrixX> params;
+        std::vector<int> primTypes;
+        for (const auto& prim : primitives) {
+            
+            Vector4 color = prim->getColor();
             color = color.cwiseMax(0.01).cwiseMin(0.99);
             color = color.array() / (1 - color.array());
             color = color.array().log();
 
+            int type = prim->getTypeId();
+            primTypes.push_back(type);
+
             switch (type) {
                 case 0: {  // 圆形
-                    MatrixX param(1, 7);
-                    param << prim->center.x(), prim->center.y(), 
-                             dynamic_cast<Circle*>(prim.get())->radius,
-                             color.x(), color.y(), color.z(), color.w();
-                    outputParams.push_back(param);
+                    auto circle = dynamic_cast<const Circle*>(prim.get());
+                    if (circle == nullptr) { // 防止转换失败（理论上不会，保险起见）
+                        params.push_back(MatrixX::Zero(1, 7));
+                        break;
+                    }
+                    MatrixX param(1, 7); // 假设每个图元参数矩阵为1行7列，可根据实际调整
+                    param(0, 0) = circle->getCenter().x();
+                    param(0, 1) = circle->getCenter().y();
+                    param(0, 2) = std::max(circle->getRadius(), 0.01);
+                    param.block<1,4>(0, 3) = color;
+                    params.push_back(param);
                     break;
                 }
-                case 1: {  // 矩形
-                    auto rect = dynamic_cast<Rectangle*>(prim.get());
+                case 1: {  // 矩形：同理，转换为 Rectangle* 后调用 getSize() 等
+                    auto rect = dynamic_cast<const Rectangle*>(prim.get());
+                    if (rect == nullptr) {
+                        params.push_back(MatrixX::Zero(1, 9)); // 矩形参数更多，用1行9列
+                        break;
+                    }
+
                     MatrixX param(1, 9);
-                    param << prim->center.x(), prim->center.y(),
-                             rect->size.x(), rect->size.y(), rect->rotateTheta, rect->roundParam,
-                             color.x(), color.y(), color.z(), color.w();
-                    outputParams.push_back(param);
+                    param(0, 0) = rect->getCenter().x();
+                    param(0, 1) = rect->getCenter().y();
+                    param(0, 2) = rect->getSize().x(); // 调用 Rectangle 特有的 getSize()
+                    param(0, 3) = rect->getSize().y();
+                    param(0, 4) = rect->getRotateTheta(); // 调用 Rectangle 特有的 getRotateTheta()
+                    param(0, 5) = std::max(rect->getRoundParam(), 0.0); // 调用 Rectangle 特有的 getRoundParam()
+                    param.block<1, 4>(0, 5) = color; // 颜色从第5列开始
+                    params.push_back(param);
                     break;
                 }
                 case 2: {  // 等边三角形
-                    auto tri = dynamic_cast<EquilateralTriangle*>(prim.get());
+                    auto tri = dynamic_cast<const EquilateralTriangle*>(prim.get());
+                    if (tri == nullptr) {
+                        params.push_back(MatrixX::Zero(1, 8));
+                        break;
+                    }
                     MatrixX param(1, 8);
-                    param << prim->center.x(), prim->center.y(),
-                             tri->edgeLength, tri->rotateTheta, tri->roundParam,
-                             color.x(), color.y(), color.z(), color.w();
-                    outputParams.push_back(param);
+                    param(0, 0) = tri->getCenter().x();
+                    param(0, 1) = tri->getCenter().y();
+                    param(0, 2) = std::max(tri->getRadius(), 0.01);
+                    param(0, 3) = tri->getRotateTheta();
+                    param(0, 4) = std::max(tri->getRoundParam(), 0.0);
+                    param.block<1,4>(0, 5) = color;
+                    params.push_back(param);
                     break;
                 }
                 case 3: { // 弯曲胶囊
-                    auto cap = dynamic_cast<CurvedCapsule*>(prim.get());
+                    auto cc = dynamic_cast<const CurvedCapsule*>(prim.get());
+                    if (cc == nullptr) {
+                        params.push_back(MatrixX::Zero(1, 10));
+                        break;
+                    }
                     MatrixX param(1, 10);
-                    param << prim->center.x(), prim->center.y(), cap->radius, cap->length, cap->rotateTheta, cap->roundParam,
-                                color.x(), color.y(), color.z(), color.w();
-                    outputParams.push_back(param);
+                    param(0, 0) = cc->getCenter().x();
+                    param(0, 1) = cc->getCenter().y();
+                    param(0, 2) = std::max(cc->getLength(), 0.01);
+                    param(0, 3) = std::max(cc->getA(), 0.01);
+                    param(0, 4) = cc->getRotateTheta();
+                    param(0, 5) = std::max(cc->getRoundParam(), 0.0);
+                    param.block<1,4>(0, 6) = color;
+                    params.push_back(param);
                     break;
                 }
-                case 4:{ // 圆弧
-                    auto arc = dynamic_cast<Arc*>(prim.get());
-                    MatrixX param(1, 10);
-                    param << prim->center.x(), prim->center.y(), arc->radius, arc->theta, arc->extAngle, arc->roundParam,
-                                color.x(), color.y(), color.z(), color.w();
-                    outputParams.push_back(param);
+                default:
+                    // 处理默认情况，可根据实际需求填充参数
+                    params.push_back(MatrixX::Zero(1, 7));
                     break;
-                }
-                case 5:{ // 梯形
-                    auto trap = dynamic_cast<Trapezoid*>(prim.get());
-                    MatrixX param(1, 11);
-                    param << prim->center.x(), prim->center.y(), trap->width1, trap->width1, trap->height, trap->rotate_theta, trap->roundParam,
-                                color.x(), color.y(), color.z(), color.w();
-                    outputParams.push_back(param);
-                    break;
-                }
-                case 6:{ // 星形
-                    auto star = dynamic_cast<Star*>(prim.get());
-                    MatrixX param(1, 11);
-                    param << prim->center.x(), prim->center.y(), star->outerRadius, star->innerRadius, (Scalar)star->numPoints, star->rotateTheta, star->roundParam,
-                                color.x(), color.y(), color.z(), color.w();
-                    outputParams.push_back(param);
-                    break;
-                }
-                case 7:{ // 半圆
-                    auto half = dynamic_cast<HalfCircle*>(prim.get());
-                    MatrixX param(1, 8);
-                    param << prim->center.x(), prim->center.y(), half->radius, half->rotateTheta, half->roundParam,
-                                color.x(), color.y(), color.z(), color.w();
-                    outputParams.push_back(param);
-                    break;
-                }
-                case 8:{ // 等腰三角形
-                    auto iso = dynamic_cast<IsoscelesTriangle*>(prim.get());
-                    MatrixX param(1, 9);
-                    param << prim->center.x(), prim->center.y(), iso->width, iso->height, iso->rotateTheta, iso->roundParam,
-                                color.x(), color.y(), color.z(), color.w();
-                    outputParams.push_back(param);
-                    break;
-
-                }
-                case 9:{ // 心形
-                    auto heart = dynamic_cast<Heart*>(prim.get());
-                    MatrixX param(1, 7);
-                    param << prim->center.x(), prim->center.y(), heart->size, heart->rotateTheta,
-                                color.x(), color.y(), color.z(), color.w();
-                    outputParams.push_back(param);
-                    break;
-                }
-                case 10:{ // 六边形
-                    auto hex = dynamic_cast<Hexagon*>(prim.get());
-                    MatrixX param(1, 8);
-                    param << prim->center.x(), prim->center.y(), hex->radius, hex->rotateTheta, hex->roundParam,
-                                color.x(), color.y(), color.z(), color.w();
-                    outputParams.push_back(param);
-                    break;
-                }
-                case 11:{ // 胶囊
-                    auto cap = dynamic_cast<Capsule*>(prim.get());
-                    MatrixX param(1, 8);
-                    param << prim->center.x(), prim->center.y(), cap->radius, cap->rotateTheta, cap->roundParam,
-                                color.x(), color.y(), color.z(), color.w();
-                    outputParams.push_back(param);
-                    break;
-                }
-
             }
         }
-        return outputParams;
+        return {params, primTypes};
     }
 
+    
     // 单阶段优化
     bool singleStageOptimize(
         std::vector<std::unique_ptr<Primitive>>& prims,
@@ -1563,7 +1875,7 @@ private:
         int height = targetImg.rows;
         std::vector<MatrixX> params;
         std::vector<int> primTypes;
-        primitivesToParams(prims, params, primTypes);
+        to_params(prims);
 
         // 初始化优化器
         AdamOptimizer optimizer(config);
@@ -1573,7 +1885,7 @@ private:
         // 优化循环
         for (int step = 0; step < config.maxSteps; step++) {
             // 重建图元
-            auto currentPrims = paramsToPrimitives(params, primTypes, prims);
+            auto currentPrims = from_params(params, primTypes, prims);
             
             // 计算损失
             MatrixX3 predRGB = DifferentiableRasterizer::renderToRGB(currentPrims, width, height, config.softness);
@@ -1604,7 +1916,7 @@ private:
                         // 正向扰动
                         auto paramsPlus = params;
                         paramsPlus[i](r, c) += eps;
-                        auto primsPlus = paramsToPrimitives(paramsPlus, primTypes, prims);
+                        auto primsPlus = from_params(paramsPlus, primTypes, prims);
                         MatrixX3 predPlus = DifferentiableRasterizer::renderToRGB(primsPlus, width, height);
                         Mat imgPlus = DifferentiableRasterizer::render(primsPlus, width, height);
                         Scalar lossPlus = LossUtils::mseLoss(predPlus, targetRGB) + LossUtils::edgeLoss(imgPlus, targetImg);
@@ -1612,7 +1924,7 @@ private:
                         // 反向扰动
                         auto paramsMinus = params;
                         paramsMinus[i](r, c) -= eps;
-                        auto primsMinus = paramsToPrimitives(paramsMinus, primTypes, prims);
+                        auto primsMinus = from_params(paramsMinus, primTypes, prims);
                         MatrixX3 predMinus = DifferentiableRasterizer::renderToRGB(primsMinus, width, height);
                         Mat imgMinus = DifferentiableRasterizer::render(primsMinus, width, height);
                         Scalar lossMinus = LossUtils::mseLoss(predMinus, targetRGB) + LossUtils::edgeLoss(imgMinus, targetImg);
@@ -1629,21 +1941,14 @@ private:
         }
 
         // 更新图元
-        prims = paramsToPrimitives(params, primTypes, prims);
+        prims = from_params(params, primTypes, prims);
         return true;
     }
-
 public:
-    PrimitiveOptimizer(OptimizerConfig cfg, std::string outDir) 
-        : config(cfg), outputDir(outDir) {
-        fs::create_directories(outputDir);
-    }
-
-    // 两阶段优化
-    std::vector<std::unique_ptr<Primitive>> stagedOptimize(
-        const std::vector<std::unique_ptr<Primitive>>& initPrims,
-        const Mat& targetImg
-    ) {
+    PrimitiveOptimizer(OptimizerConfig c, const std::string& out) : config(c), outputDir(out) { std::filesystem::create_directories(outputDir); }
+    // Convenience ctor used by test.cpp
+    PrimitiveOptimizer(OptimizerConfig c) : config(c), outputDir("output") { std::filesystem::create_directories(outputDir); }
+    std::vector<std::unique_ptr<Primitive>> stagedOptimize(const std::vector<std::unique_ptr<Primitive>>& initPrims, const Mat& targetImg) {
         // Deep-clone initial primitives because unique_ptr is non-copyable
         std::vector<std::unique_ptr<Primitive>> prims;
         prims.reserve(initPrims.size());
@@ -1659,7 +1964,7 @@ public:
         singleStageOptimize(prims, targetImg, "optimization_frames", false);
         saveParams(prims, outputDir + "/geo_optimized_params.txt");
 
-    // 阶段2：边缘与交点优化
+        // 阶段2：边缘与交点优化
         std::cout << "=== 阶段2: 边缘与交点优化 ===" << std::endl;
         OptimizerConfig edgeCfg = config;
         edgeCfg.lr = 0.01;
@@ -1688,411 +1993,6 @@ public:
     }
 };
 
-// Adam优化器
-class AdamOptimizer {
-private:
-    OptimizerConfig config;
-    std::vector<MatrixX> m, v;  // 动量缓存
-    int step = 0;
-    const Scalar beta1 = 0.9;
-    const Scalar beta2 = 0.999;
-    const Scalar eps = 1e-8;
-
-public:
-    AdamOptimizer(OptimizerConfig cfg) : config(cfg) {}
-
-    void initMomentum(const std::vector<MatrixX>& params) {
-        m.resize(params.size());
-        v.resize(params.size());
-        for (size_t i = 0; i < params.size(); i++) {
-            m[i] = MatrixX::Zero(params[i].rows(), params[i].cols());
-            v[i] = MatrixX::Zero(params[i].rows(), params[i].cols());
-        }
-    }
-
-    Scalar getCurrentLR() const {
-        Scalar decay = pow(config.decayRate, (Scalar)step / config.decaySteps);
-        return config.lr * decay;
-    }
-
-    void clipGradients(std::vector<MatrixX>& grads) const {
-        Scalar totalNorm = 0;
-        for (const auto& g : grads) totalNorm += g.squaredNorm();
-        totalNorm = sqrt(totalNorm);
-        if (totalNorm > config.clipNorm && totalNorm > 0) {
-            Scalar scale = config.clipNorm / totalNorm;
-            for (auto& g : grads) g *= scale;
-        }
-    }
-
-    void update(std::vector<MatrixX>& params, const std::vector<MatrixX>& grads) {
-        if (m.empty()) initMomentum(params);
-        Scalar lr = getCurrentLR();
-        step++;
-
-        // 梯度裁剪
-        std::vector<MatrixX> clippedGrads = grads;
-        clipGradients(clippedGrads);
-
-        // Adam更新
-        for (size_t i = 0; i < params.size(); i++) {
-            m[i] = beta1 * m[i] + (1 - beta1) * clippedGrads[i];
-            v[i] = beta2 * v[i] + (1 - beta2) * clippedGrads[i].array().square().matrix();
-            MatrixX mHat = m[i] / (1 - pow(beta1, step));
-            MatrixX vHat = v[i] / (1 - pow(beta2, step));
-            params[i] -= lr * mHat.array().cwiseQuotient((vHat.array().sqrt() + eps)).matrix();
-        }
-    }
-};
-
-// 损失函数工具
-class LossUtils {
-public:
-    // MSE损失（RGB通道）
-    static Scalar mseLoss(const MatrixX3& pred, const MatrixX3& target) {
-    return (pred - target).array().square().mean();
-    }
-
-    // 边缘一致性损失（Sobel算子）
-    static Scalar edgeLoss(const Mat& predImg, const Mat& targetImg) {
-        Mat predGray, targetGray;
-    cvtColor(predImg, predGray, cv::COLOR_RGBA2GRAY);
-    cvtColor(targetImg, targetGray, cv::COLOR_RGBA2GRAY);
-
-        Mat sobelXPred, sobelXTarget;
-        Sobel(predGray, sobelXPred, CV_64F, 1, 0, 3);
-        Sobel(targetGray, sobelXTarget, CV_64F, 1, 0, 3);
-
-        Mat diff;
-        absdiff(sobelXPred, sobelXTarget, diff);
-    return cv::mean(diff)[0] / 255.0;
-    }
-
-    // 交点感知损失
-    static Scalar intersectionLoss(
-        const std::vector<std::unique_ptr<Primitive>>& prims,
-        const MatrixX2& grid,
-        const MatrixX3& targetRGB,
-        const MatrixX3& predRGB
-    ) {
-        // 计算所有图元SDF
-        std::vector<VectorX> sdfs;
-        for (const auto& prim : prims) {
-            sdfs.push_back(prim->sdf(grid));
-        }
-
-        // 排序取最近/次近SDF
-        int numPixels = grid.rows();
-        VectorX minSDF = VectorX::Constant(numPixels, 1e9);
-        VectorX secondMinSDF = VectorX::Constant(numPixels, 1e9);
-        for (const auto& sdf : sdfs) {
-            for (int i = 0; i < numPixels; i++) {
-                if (sdf(i) < minSDF(i)) {
-                    secondMinSDF(i) = minSDF(i);
-                    minSDF(i) = sdf(i);
-                } else if (sdf(i) < secondMinSDF(i)) {
-                    secondMinSDF(i) = sdf(i);
-                }
-            }
-        }
-
-        // 交点权重计算
-        VectorX weight = (-minSDF * 100).array().exp().cwiseQuotient(
-            (-minSDF * 100).array().exp() + 1
-        ) * (-secondMinSDF * 50).array().exp().cwiseQuotient(
-            (-secondMinSDF * 50).array().exp() + 1
-        );
-
-        // 加权MSE
-    MatrixX3 diff = (predRGB - targetRGB).array().square().matrix();
-        VectorX weightedDiff = diff.rowwise().mean().cwiseProduct(weight);
-        
-        // 平滑正则项
-        VectorX sdfDiff = (minSDF - secondMinSDF).cwiseAbs();
-        Scalar smoothReg = (-sdfDiff * 100).array().exp().mean();
-
-        return weightedDiff.mean() + 0.1 * smoothReg;
-    }
-};
-
-// 可微光栅化器
-class DifferentiableRasterizer {
-public:
-    static Mat render(
-        const std::vector<std::unique_ptr<Primitive>>& prims,
-        int width, int height,
-        Scalar softness = 150.0,
-        bool isFirst = true
-    ) {
-        // 创建归一化网格
-        MatrixX2 grid(width * height, 2);
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                int idx = y * width + x;
-                grid(idx, 0) = (Scalar)x / (width - 1);
-                grid(idx, 1) = (Scalar)y / (height - 1);
-            }
-        }
-
-        // 计算SDF和覆盖度
-        int numPrims = prims.size();
-        std::vector<VectorX> sdfs(numPrims);
-        std::vector<VectorX> coverage(numPrims);
-        std::vector<Vector3> baseColors(numPrims);
-        std::vector<Scalar> depths(numPrims);
-
-        for (int i = 0; i < numPrims; i++) {
-            sdfs[i] = prims[i]->sdf(grid);
-            // Sigmoid软化
-            coverage[i] = (-sdfs[i] * softness).array().exp().cwiseQuotient(
-                (-sdfs[i] * softness).array().exp() + 1
-            );
-            baseColors[i] = prims[i]->color.head<3>();
-            depths[i] = prims[i]->depth;
-            std::cout << "sdfs: " << sdfs[i].transpose() << "s\n";
-
-        }
-
-        // 深度权重（Softmax）
-        MatrixX depthWeights(numPrims, width * height);
-        for (int i = 0; i < numPrims; i++) {
-            depthWeights.row(i) = (depths[i] * 0.01) * VectorX::Ones(width * height);
-        }
-        depthWeights = depthWeights.array().exp();
-        depthWeights = depthWeights.array().rowwise() / depthWeights.colwise().sum().array();
-
-        // 颜色混合（按像素计算权重：weight_i(p) = depthWeight_i(p) * alpha_i(p))
-        MatrixX3 predRGB(width * height, 3);
-        predRGB.setZero();
-        VectorX predAlpha(width * height);
-        predAlpha.setZero();
-
-        // Build per-primitive per-pixel weights matrix
-        MatrixX weights(numPrims, width * height);
-        for (int i = 0; i < numPrims; ++i) {
-            VectorX alpha = prims[i]->color.w() * coverage[i];
-            // depthWeights.row(i) is 1 x (w*h)
-            weights.row(i) = depthWeights.row(i).cwiseProduct(alpha.transpose());
-        }
-
-        // Normalize per-pixel
-        VectorX sumWeights = weights.colwise().sum().transpose();
-        for (int p = 0; p < width * height; ++p) {
-            Scalar s = sumWeights(p) + 1e-8;
-            for (int i = 0; i < numPrims; ++i) {
-                Scalar w = weights(i, p) / s;
-                for (int c = 0; c < 3; ++c) {
-                    predRGB(p, c) += baseColors[i](c) * w;
-                }
-                predAlpha(p) += prims[i]->color.w() * coverage[i](p) * w;
-            }
-        }
-
-        // 诊断信息：输出平均颜色/alpha以帮助定位空白图问题（写入临时文件以确保持久化）
-        {
-            Scalar meanR = predRGB.col(0).mean();
-            Scalar meanG = predRGB.col(1).mean();
-            Scalar meanB = predRGB.col(2).mean();
-            Scalar meanA = predAlpha.mean();
-            // write to /tmp for persistence
-            std::ofstream dbg("/tmp/raster_debug.txt", std::ios::app);
-            dbg << "prims=" << prims.size() << " meanR=" << meanR << " meanG=" << meanG << " meanB=" << meanB << " meanA=" << meanA << "\n";
-            if (!prims.empty()) dbg << "first_type=" << prims[0]->getTypeId() << " first_color=" << prims[0]->color.transpose() << "\n";
-            dbg.close();
-        }
-
-        // 转换为OpenCV图像
-        Mat img(height, width, CV_8UC4);
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                int idx = y * width + x;
-                Vec4b& pixel = img.at<Vec4b>(y, x);
-                pixel[0] = (uchar)(predRGB(idx, 2) * 255);  // B
-                pixel[1] = (uchar)(predRGB(idx, 1) * 255);  // G
-                pixel[2] = (uchar)(predRGB(idx, 0) * 255);  // R
-                pixel[3] = (uchar)(predAlpha(idx) * 255);   // A
-            }
-        }
-        return img;
-    }
-
-    // 优化专用光栅化（返回归一化RGB）
-    static MatrixX3 renderToRGB(
-        const std::vector<std::unique_ptr<Primitive>>& prims,
-        int width, int height,
-        Scalar softness = 150.0
-    ) {
-        Mat img = render(prims, width, height, softness);
-        MatrixX3 rgb(width * height, 3);
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                int idx = y * width + x;
-                Vec4b pixel = img.at<Vec4b>(y, x);
-                rgb(idx, 0) = pixel[2] / 255.0;  // R
-                rgb(idx, 1) = pixel[1] / 255.0;  // G
-                rgb(idx, 2) = pixel[0] / 255.0;  // B
-            }
-        }
-        return rgb;
-    }
-};
 
 
-// 工具类（加载/保存/对比）
-class MainUtils {
-public:
-    // 加载目标图像
-    static Mat loadTargetImage(const std::string& path) {
-    Mat img = imread(path, cv::IMREAD_UNCHANGED);
-        if (img.empty()) throw std::runtime_error("无法加载目标图像: " + path);
-    if (img.channels() == 1) cvtColor(img, img, cv::COLOR_GRAY2RGBA);
-    else if (img.channels() == 3) cvtColor(img, img, cv::COLOR_BGR2RGBA);
-        else if (img.channels() != 4) throw std::runtime_error("不支持的通道数: " + std::to_string(img.channels()));
-        return img;
-    }
-
-    // 从JSON加载图元
-    static std::vector<std::unique_ptr<Primitive>> loadPrimitivesFromJson(const std::string& jsonPath) {
-        std::vector<std::unique_ptr<Primitive>> prims;
-        std::ifstream f(jsonPath);
-        if (!f.is_open()) throw std::runtime_error("无法打开JSON文件: " + jsonPath);
-        
-    nlohmann::json data;
-    f >> data;
-        auto shapesId = data["shapes id"].get<std::vector<int>>();
-        auto shapesOp = data["shapes op"].get<std::vector<int>>();
-        auto shapesParams = data["shapes params"].get<std::vector<std::vector<Scalar>>>();
-
-        for (size_t i = 0; i < shapesId.size(); i++) {
-            int type = shapesId[i];
-            int op = shapesOp[i];
-            auto& params = shapesParams[i];
-            Scalar depth = i + 1;
-
-            // 颜色设置（op=1为黑色，其他为白色）
-            Vector4 color(1, 1, 1, 0.999);
-            if (op == 1) color = Vector4(0, 0, 0, 0.999);
-
-            switch (type) {
-                case 0: {  // 圆形
-                    Vector2 center(params[0], params[1]);
-                    Scalar radius = params[2];
-                    prims.push_back(std::make_unique<Circle>(center, radius, color, depth));
-                    break;
-                }
-                case 1: {  // 矩形
-                    Vector2 center(params[0], params[1]);
-                    Vector2 size(params[2], params[3]);
-                    Scalar rt = params[4], rp = params[5];
-                    prims.push_back(std::make_unique<Rectangle>(center, size, rt, rp, color, depth));
-                    break;
-                }
-                case 2: {  // 等边三角形
-                    Vector2 center(params[0], params[1]);
-                    Scalar size = params[2];
-                    Scalar rt = params[3], rp = params[4];
-                    prims.push_back(std::make_unique<EquilateralTriangle>(center, size, rt, rp, color, depth));
-                    break;
-                }
-                case 3: { //弯曲胶囊
-                    Vector2 center(params[0], params[1]);
-                    Scalar length= params[2];
-                    Scalar a = params[3];
-                    Scalar rt = params[3], rp = params[4];
-                    prims.push_back(std::make_unique<CurvedCapsule>(center, length, a, rt, rp, color, depth));
-                    break;
-                }
-                case 4: {  // 圆弧
-                    Vector2 center(params[0], params[1]);
-                    Scalar radius = params[2];
-                    Scalar startAngle = params[3], endAngle = params[4];
-                    Scalar width = params[5];
-                    prims.push_back(std::make_unique<Arc>(center, radius, startAngle, endAngle, width, color, depth));
-                    break;
-                }
-                case 5:{ //梯形
-                    Vector2 center(params[0], params[1]);
-                    Scalar width1=params[2], width2=params[3], height=params[4], rt = params[5], rp = params[6];
-                    prims.push_back(std::make_unique<Trapezoid>(center, width1, width2, height, rt, rp, color, depth));
-                    break;
-
-                }
-                case 6: {  // 星形
-                    Vector2 center(params[0], params[1]);
-                    Scalar outerRadius = params[2];
-                    Scalar innerRadius = params[3];
-                    int numPoints = std::max(3, (int)params[4]);
-                    Scalar rt = params[5], rp = params[6];
-                    prims.push_back(std::make_unique<Star>(center, outerRadius, innerRadius, numPoints, rt, rp, color, depth));
-                    break;
-                }
-                case 7: {  // 半圆
-                    Vector2 center(params[0], params[1]);
-                    Scalar radius = params[2];
-                    Scalar rotateTheta = params[3];
-                    Scalar rotateParam = params[4];
-                    prims.push_back(std::make_unique<HalfCircle>(center, radius, rotateTheta, rotateParam, color, depth));
-                    break;
-                }
-                case 8:{ // 等腰三角形
-                    Vector2 center(params[0], params[1]);
-                    Scalar base = params[2];
-                    Scalar height = params[3];
-                    Scalar rotateTheta = params[4];
-                    Scalar rp = params[5];
-                    prims.push_back(std::make_unique<IsoscelesTriangle>(center, base, height, rotateTheta, rp, color, depth));
-                    break;
-
-                }
-                case 9: {  // 心形
-                    Vector2 center(params[0], params[1]);
-                    Scalar size = params[2];
-                    Scalar rotateTheta = params[3];
-                    prims.push_back(std::make_unique<Heart>(center, size, rotateTheta, color, depth));
-                    break;
-                }
-                case 10: {  // 六边形
-                    Vector2 center(params[0], params[1]);
-                    Scalar radius = params[2];
-                    Scalar rotateTheta = params[3];
-                    Scalar roundParam = params[4];
-                    prims.push_back(std::make_unique<Hexagon>(center, radius, rotateTheta, roundParam, color, depth));
-                    break;
-                }     
-                case 11: {  // 胶囊
-                    Vector2 center(params[0], params[1]);
-                    Scalar radius = params[2];
-                    Scalar rotateTheta = params[3];
-                    Scalar roundParam = params[4];
-                    prims.push_back(std::make_unique<Capsule>(center, radius, rotateTheta, roundParam, color, depth));
-                    break;
-                }
-                default:
-                    std::cerr << "未知图元类型ID: " << type << std::endl;
-                    break;
-        }
-        return prims;
-    }
-
-    // 生成对比图像
-    static void saveComparison(
-        const Mat& target,
-        const Mat& initial,
-        const Mat& optimized,
-        const std::string& savePath
-    ) {
-        int width = target.cols;
-        int height = target.rows;
-        Mat comp(height, width * 3, CV_8UC4);
-        
-    target.copyTo(comp(cv::Rect(0, 0, width, height)));
-    initial.copyTo(comp(cv::Rect(width, 0, width, height)));
-    optimized.copyTo(comp(cv::Rect(width * 2, 0, width, height)));
-        
-    putText(comp, "Target", Point(10, 30), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(255, 255, 255), 2);
-    putText(comp, "Initial", Point(width + 10, 30), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(255, 255, 255), 2);
-    putText(comp, "Optimized", Point(width * 2 + 10, 30), cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(255, 255, 255), 2);
-        
-        imwrite(savePath, comp);
-    }
-};
+// #endif // PRIMITIVE_RENDER_H
